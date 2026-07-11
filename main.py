@@ -3,6 +3,7 @@ import os
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, status
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 from sqlalchemy import Column, Integer, String, create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
@@ -81,7 +82,7 @@ def shorten_url(payload: ShortenRequest):
         db.close()
 
 
-@app.get("/{short_code}", response_model=URLResponse)
+@app.get("/{short_code}")
 def get_original_url(short_code: str):
     db = SessionLocal()
     try:
@@ -91,6 +92,6 @@ def get_original_url(short_code: str):
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Short code not found.",
             )
-        return URLResponse(original_url=mapping.original_url)
+        return RedirectResponse(url=mapping.original_url, status_code=status.HTTP_301_MOVED_PERMANENTLY)
     finally:
         db.close()
