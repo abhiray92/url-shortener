@@ -2,21 +2,16 @@ import hashlib
 import os
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 from sqlalchemy import Column, Integer, String, create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-if DATABASE_URL:
-    engine = create_engine(DATABASE_URL)
-else:
-    db_path = os.getenv("DB_PATH", "/app/url_shortener.db")
-    engine = create_engine(f"sqlite:///{db_path}")
-
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./url_shortener.db")
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
 Base = declarative_base()
 
 
@@ -30,68 +25,49 @@ class URLMapping(Base):
 
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="URL Shortener")
+app = FastAPI()
 
 
 class ShortenRequest(BaseModel):
     long_url: str
 
 
-class ShortenResponse(BaseModel):
-    short_code: str
-
-
-class URLResponse(BaseModel):
-    original_url: str
-
-
-def generate_short_code(long_url: str) -> str:
-    return hashlib.sha256(long_url.encode("utf-8")).hexdigest()[:8]
-
-
-def validate_url(long_url: str) -> str:
-    parsed = urlparse(long_url)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Please provide a valid http/https URL.",
-        )
-    return long_url
-
-
-@app.post("/shorten", response_model=ShortenResponse)
-def shorten_url(payload: ShortenRequest):
-    long_url = validate_url(payload.long_url)
-
+def get_db():
     db = SessionLocal()
     try:
-        existing = db.query(URLMapping).filter(URLMapping.original_url == long_url).first()
-        if existing:
-            return ShortenResponse(short_code=existing.short_code)
-
-        short_code = generate_short_code(long_url)
-        while db.query(URLMapping).filter(URLMapping.short_code == short_code).first():
-            short_code = generate_short_code(long_url + "-")
-
-        mapping = URLMapping(short_code=short_code, original_url=long_url)
-        db.add(mapping)
-        db.commit()
-        db.refresh(mapping)
-        return ShortenResponse(short_code=mapping.short_code)
+        yield db
     finally:
         db.close()
+
+
+def validate_url(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise HTTPException(status_code=400, detail="Please provide a valid http/https URL.")
+    return url
+
+
+@app.post("/shorten")
+def shorten_url(payload: ShortenRequest, db=Depends(get_db)):
+    validated_url = validate_url(payload.long_url)
+
+    existing_mapping = db.query(URLMapping).filter(URLMapping.original_url == validated_url).first()
+    if existing_mapping:
+        return {"short_code": existing_mapping.short_code}
+
+    short_code = hashlib.sha1(validated_url.encode("utf-8").lower()).hexdigest()[:8]
+    mapping = URLMapping(short_code=short_code, original_url=validated_url)
+    db.add(mapping)
+    db.commit()
+    db.refresh(mapping)
+
+    return {"short_code": mapping.short_code}
 
 
 @app.get("/{short_code}")
-def get_original_url(short_code: str):
-    db = SessionLocal()
-    try:
-        mapping = db.query(URLMapping).filter(URLMapping.short_code == short_code).first()
-        if not mapping:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Short code not found.",
-            )
-        return RedirectResponse(url=mapping.original_url, status_code=status.HTTP_301_MOVED_PERMANENTLY)
-    finally:
-        db.close()
+def redirect_to_url(short_code: str, db=Depends(get_db)):
+    mapping = db.query(URLMapping).filter(URLMapping.short_code == short_code).first()
+    if not mapping:
+        raise HTTPException(status_code=404, detail="Short code not found")
+
+    return RedirectResponse(url=mapping.original_url, status_code=301)
